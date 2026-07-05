@@ -155,7 +155,20 @@ fn process_file(path: &str, content: &str) -> Vec<String> {
     let mut signatures = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
-        if (trimmed.starts_with("fn ") || trimmed.starts_with("func ") || trimmed.starts_with("class ") || trimmed.starts_with("struct ") || trimmed.starts_with("def ") || trimmed.starts_with("type ") || trimmed.starts_with("interface ")) && trimmed.contains("{") {
+        
+        // Strip common access/export modifiers to safely detect the real keyword
+        let mut cleaned = trimmed;
+        for modifier in &["export ", "default ", "async ", "public ", "private ", "protected ", "static ", "abstract ", "final "] {
+            while cleaned.starts_with(modifier) {
+                cleaned = &cleaned[modifier.len()..];
+            }
+        }
+
+        let is_structural = ["fn ", "func ", "function ", "fun ", "class ", "struct ", "def ", "type ", "interface "]
+            .iter()
+            .any(|&k| cleaned.starts_with(k));
+
+        if is_structural && trimmed.contains("{") {
             let sig = trimmed.split('{').next().unwrap().trim().to_string();
             signatures.push(sig);
         }
