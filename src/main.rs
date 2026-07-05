@@ -3,11 +3,13 @@ use clap::{
     builder::styling::{AnsiColor, Effects, Styles},
 };
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
-use serde::Serialize;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tokio::fs;
 
 fn cli_styles() -> Styles {
@@ -55,6 +57,13 @@ struct AgentJsonOutput {
     files: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct CacheEntry {
+    sha256_hash: String,
+    last_modified_timestamp: u64,
+    signatures: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -73,59 +82,137 @@ async fn main() {
     let output_json = Arc::new(Mutex::new(BTreeMap::new()));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(64)); // bound concurrency
 
+    // Load Cache
+    let path_meta = std::fs::metadata(&cli.path).ok();
+    let cache_dir = if path_meta.as_ref().is_some_and(|m| m.is_dir()) {
+        Path::new(&cli.path).to_path_buf()
+    } else if let Some(parent) = Path::new(&cli.path).parent() {
+        parent.to_path_buf()
+    } else {
+        Path::new(".").to_path_buf()
+    };
+
+    let cache_file_path = cache_dir.join(".skelta_cache.json");
+    let cache_data: HashMap<String, CacheEntry> = std::fs::read_to_string(&cache_file_path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
+    let cache_arc = Arc::new(Mutex::new(cache_data));
+
     let mut tasks = vec![];
 
-    for result in walker {
-        if let Ok(entry) = result {
-            let format = cli.format.clone();
+    for entry in walker.flatten() {
+        let format = cli.format.clone();
 
-            if format == Format::TreeOnly {
-                let depth = entry.depth();
-                let name = entry.file_name().to_string_lossy().to_string();
-                let indent = "  ".repeat(if depth > 0 { depth - 1 } else { 0 });
-                let prefix = if depth > 0 { "├── " } else { "" };
-                let mut out_md = output_md.lock().unwrap();
-                out_md.push_str(&format!("{}{}{}\n", indent, prefix, name));
+        if format == Format::TreeOnly {
+            let depth = entry.depth();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let indent = "  ".repeat(if depth > 0 { depth - 1 } else { 0 });
+            let prefix = if depth > 0 { "├── " } else { "" };
+            let mut out_md = output_md.lock().unwrap();
+            out_md.push_str(&format!("{}{}{}\n", indent, prefix, name));
+            continue;
+        }
+
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            let path = entry.path().to_path_buf();
+
+            if format != Format::TreeOnly && !is_code_file(&path) {
                 continue;
             }
 
-            if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                let path = entry.path().to_path_buf();
+            let out_md_clone = Arc::clone(&output_md);
+            let out_json_clone = Arc::clone(&output_json);
+            let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+            let cache_arc_clone = Arc::clone(&cache_arc);
 
-                if format != Format::TreeOnly && !is_code_file(&path) {
-                    continue;
-                }
+            tasks.push(tokio::spawn(async move {
+                let _permit = permit;
+                let path_str = path.display().to_string();
 
-                let out_md_clone = Arc::clone(&output_md);
-                let out_json_clone = Arc::clone(&output_json);
-                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                let metadata = fs::metadata(&path).await.ok();
+                let modified = metadata
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
 
-                tasks.push(tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Ok(content) = fs::read_to_string(&path).await {
-                        let path_str = path.display().to_string();
-                        let signatures = process_file(&path_str, &content);
+                let mut use_cache = false;
+                let mut cached_sigs = None;
+                let mut cached_hash = String::new();
 
-                        if !signatures.is_empty() {
-                            if format == Format::AgentMd {
-                                let mut md = out_md_clone.lock().unwrap();
-                                md.push_str(&format!("### File: {}\n", path_str));
-                                for sig in signatures {
-                                    md.push_str(&format!("- `{}`\n", sig));
-                                }
-                                md.push('\n');
-                            } else if format == Format::AgentJson {
-                                let mut json = out_json_clone.lock().unwrap();
-                                json.insert(path_str, signatures);
-                            }
+                {
+                    let cache_lock = cache_arc_clone.lock().unwrap();
+                    if let Some(entry) = cache_lock.get(&path_str) {
+                        cached_hash = entry.sha256_hash.clone();
+                        if entry.last_modified_timestamp == modified && modified > 0 {
+                            use_cache = true;
+                            cached_sigs = Some(entry.signatures.clone());
                         }
                     }
-                }));
-            }
+                }
+
+                let mut file_hash = String::new();
+                let signatures = if use_cache {
+                    cached_sigs.unwrap()
+                } else if let Ok(content) = fs::read_to_string(&path).await {
+                    let mut hasher = Sha256::new();
+                    hasher.update(content.as_bytes());
+                    file_hash = format!("{:x}", hasher.finalize());
+
+                    if file_hash == cached_hash && !cached_hash.is_empty() {
+                        // Hash matches, just metadata was updated
+                        let cache_lock = cache_arc_clone.lock().unwrap();
+                        cache_lock.get(&path_str).unwrap().signatures.clone()
+                    } else {
+                        process_file(&path_str, &content)
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                if !file_hash.is_empty() {
+                    let mut cache_lock = cache_arc_clone.lock().unwrap();
+                    cache_lock.insert(
+                        path_str.clone(),
+                        CacheEntry {
+                            sha256_hash: file_hash,
+                            last_modified_timestamp: modified,
+                            signatures: signatures.clone(),
+                        },
+                    );
+                } else if use_cache {
+                    // Update timestamp just in case
+                    let mut cache_lock = cache_arc_clone.lock().unwrap();
+                    if let Some(entry) = cache_lock.get_mut(&path_str) {
+                        entry.last_modified_timestamp = modified;
+                    }
+                }
+
+                if !signatures.is_empty() {
+                    if format == Format::AgentMd {
+                        let mut md = out_md_clone.lock().unwrap();
+                        md.push_str(&format!("### File: {}\n", path_str));
+                        for sig in signatures {
+                            md.push_str(&format!("- `{}`\n", sig));
+                        }
+                        md.push('\n');
+                    } else if format == Format::AgentJson {
+                        let mut json = out_json_clone.lock().unwrap();
+                        json.insert(path_str, signatures);
+                    }
+                }
+            }));
         }
     }
 
     futures_util::future::join_all(tasks).await;
+
+    // Save cache
+    if let Ok(cache_lock) = cache_arc.lock() {
+        let _ =
+            serde_json::to_string(&*cache_lock).map(|json| std::fs::write(&cache_file_path, json));
+    }
 
     let mut out: Box<dyn Write> = match cli.out {
         Some(ref p) => {
@@ -151,7 +238,7 @@ async fn main() {
 }
 
 // ponytail: basic extension filter
-fn is_code_file(path: &PathBuf) -> bool {
+fn is_code_file(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         matches!(
             ext.to_lowercase().as_str(),
