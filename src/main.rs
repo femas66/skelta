@@ -111,7 +111,12 @@ async fn main() {
     futures_util::future::join_all(tasks).await;
 
     let mut out: Box<dyn Write> = match cli.out {
-        Some(ref p) => Box::new(std::fs::File::create(p).expect("Failed to create output file")),
+        Some(ref p) => {
+            if let Some(parent) = std::path::Path::new(p).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            Box::new(std::fs::File::create(p).expect("Failed to create output file"))
+        }
         None => Box::new(io::stdout()),
     };
 
@@ -156,11 +161,16 @@ fn process_file(path: &str, content: &str) -> Vec<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         
-        // Strip common access/export modifiers to safely detect the real keyword
+        // Strip common access/export modifiers in any order safely
         let mut cleaned = trimmed;
-        for modifier in &["export ", "default ", "async ", "public ", "private ", "protected ", "static ", "abstract ", "final "] {
-            while cleaned.starts_with(modifier) {
-                cleaned = &cleaned[modifier.len()..];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for modifier in &["export ", "default ", "async ", "public ", "private ", "protected ", "static ", "abstract ", "final "] {
+                if cleaned.starts_with(modifier) {
+                    cleaned = &cleaned[modifier.len()..];
+                    changed = true;
+                }
             }
         }
 
