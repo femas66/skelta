@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{builder::styling::{AnsiColor, Effects, Styles}, Parser, ValueEnum};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -7,9 +7,21 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
 
+fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Green.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Magenta.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Yellow.on_default())
+        .error(AnsiColor::Red.on_default() | Effects::BOLD)
+        .valid(AnsiColor::Green.on_default() | Effects::BOLD)
+        .invalid(AnsiColor::Yellow.on_default() | Effects::BOLD)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "skelta")]
 #[command(about = "A fast code structural blueprinter", long_about = None)]
+#[command(styles = cli_styles())]
 struct Cli {
     /// The directory to scan (defaults to current directory './')
     #[arg(default_value = "./")]
