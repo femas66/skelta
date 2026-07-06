@@ -271,12 +271,10 @@ async fn main() -> Result<()> {
     let mut updated_cache = Arc::try_unwrap(cache_arc).unwrap_or_else(|arc| (*arc).clone());
 
     let results = futures_util::future::join_all(tasks).await;
-    for res in results {
-        if let Ok((path_str, file_data, cache_entry_opt)) = res {
-            output_files.insert(path_str.clone(), file_data);
-            if let Some(entry) = cache_entry_opt {
-                updated_cache.insert(path_str, entry);
-            }
+    for (path_str, file_data, cache_entry_opt) in results.into_iter().flatten() {
+        output_files.insert(path_str.clone(), file_data);
+        if let Some(entry) = cache_entry_opt {
+            updated_cache.insert(path_str, entry);
         }
     }
 
