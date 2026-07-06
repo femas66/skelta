@@ -9,11 +9,14 @@ It is specifically designed for **AI Coding Agents** (like Anthropic Computer Us
 - **Universal AST Parsing:** Powered by `tree-sitter`, Skelta performs true syntactic analysis (starting natively with Rust) to cleanly extract structural blueprints without regex hacks.
 - **Asynchronous Parallel Speed:** Built on top of `tokio`, Skelta dispatches file parsing across all available CPU cores concurrently while strictly managing memory limits via backpressure semaphores.
 - **`.gitignore` Native:** Automatically respects your `.gitignore` rules (powered by the `ignore` crate) so `node_modules` and `target` directories never bloat your blueprint.
+- **Smart Caching:** Avoids parsing unchanged files by maintaining a local `.skelta_cache.json` utilizing file modification metadata and SHA-256 integrity hashing.
+- **Focus Window Scope Control:** Restricts detailed extraction to a specific target file or folder, generating a shallow skeleton for the rest of the codebase to save tokens.
 
 ## How it works
-1. **Discovery:** Traverses directories asynchronously, filtering out ignored files and non-coding file extensions.
-2. **Parallel AST Parsing:** Dispatches syntax tree extraction to the `tokio` thread pool. `tree-sitter` analyzes the structure to identify classes, structs, and methods.
-3. **Abstraction (Flattener):** Strips out *all* internal function logic completely. Only exact method/function signatures are retained in the final output format.
+1. **Discovery:** Traverses directories asynchronously, filtering out ignored files and non-coding file extensions. It applies the "Focus Window" filter to skip deep traversals outside the target.
+2. **Smart Caching Check:** Before reading, it verifies the file modification timestamp against `.skelta_cache.json`. If changed, it falls back to checking the SHA-256 hash. If unchanged, it skips parsing entirely and loads cached signatures.
+3. **Parallel AST Parsing:** For modified or focused files, it dispatches syntax tree extraction to the `tokio` thread pool. `tree-sitter` analyzes the structure to identify classes, structs, and methods.
+4. **Abstraction (Flattener):** Strips out *all* internal function logic completely. Only exact method/function signatures are retained in the final output format.
 
 ## Prerequisites
 - [Rust](https://rustup.rs/) (cargo) installed on your system.
@@ -50,6 +53,9 @@ skelta ./src --format tree-only
 
 # Exclude specific patterns
 skelta ./src --exclude "*.md"
+
+# Focus on a specific directory or file (full detail), and limit outside depth to 1
+skelta ./src --focus ./src/auth --depth-outside 1
 
 # View all commands and flags
 skelta --help
