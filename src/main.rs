@@ -59,7 +59,16 @@ struct AgentJsonFile {
 }
 
 #[derive(Serialize)]
+struct ProjectMetadata {
+    scan_directory: String,
+    focused_path: Option<String>,
+    total_files: usize,
+    total_focused_files: usize,
+}
+
+#[derive(Serialize)]
 struct AgentJsonOutput {
+    project_metadata: ProjectMetadata,
     files: BTreeMap<String, AgentJsonFile>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     local_dependency_graph: Vec<(String, String)>,
@@ -86,8 +95,8 @@ async fn main() {
         .build()
         .unwrap_or_else(|_| OverrideBuilder::new(&cli.path).build().unwrap());
 
-    let output_md = Arc::new(Mutex::new(String::new()));
-    let output_json = Arc::new(Mutex::new(BTreeMap::new()));
+    let output_tree = Arc::new(Mutex::new(String::new()));
+    let output_files = Arc::new(Mutex::new(BTreeMap::new()));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
 
     let focus_path = cli
@@ -140,7 +149,7 @@ async fn main() {
             let name = entry.file_name().to_string_lossy().to_string();
             let indent = "  ".repeat(if depth > 0 { depth - 1 } else { 0 });
             let prefix = if depth > 0 { "├── " } else { "" };
-            let mut out_md = output_md.lock().unwrap();
+            let mut out_md = output_tree.lock().unwrap();
             out_md.push_str(&format!("{}{}{}\n", indent, prefix, name));
             continue;
         }
@@ -158,8 +167,7 @@ async fn main() {
                 true
             };
 
-            let out_md_clone = Arc::clone(&output_md);
-            let out_json_clone = Arc::clone(&output_json);
+            let out_files_clone = Arc::clone(&output_files);
             let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
             let cache_arc_clone = Arc::clone(&cache_arc);
 
@@ -234,36 +242,15 @@ async fn main() {
                     }
                 }
 
-                if format == Format::AgentMd {
-                    let mut md = out_md_clone.lock().unwrap();
-                    if is_focused && (!signatures.is_empty() || !dependencies.is_empty()) {
-                        md.push_str(&format!("\n### [FOCUSED] File: {}\n", path_str));
-                        if !dependencies.is_empty() {
-                            md.push_str("#### Dependencies:\n");
-                            for dep in &dependencies {
-                                md.push_str(&format!("- `{}`\n", dep));
-                            }
-                        }
-                        if !signatures.is_empty() {
-                            md.push_str("#### Signatures:\n");
-                            for sig in &signatures {
-                                md.push_str(&format!("- `{}`\n", sig));
-                            }
-                        }
-                    } else if !is_focused {
-                        md.push_str(&format!("- [Out of focus] {}\n", path_str));
-                    }
-                } else if format == Format::AgentJson {
-                    let mut json = out_json_clone.lock().unwrap();
-                    json.insert(
-                        path_str,
-                        AgentJsonFile {
-                            is_focused,
-                            signatures,
-                            dependencies,
-                        },
-                    );
-                }
+                let mut out_lock = out_files_clone.lock().unwrap();
+                out_lock.insert(
+                    path_str,
+                    AgentJsonFile {
+                        is_focused,
+                        signatures,
+                        dependencies,
+                    },
+                );
             }));
         }
     }
@@ -275,17 +262,18 @@ async fn main() {
             serde_json::to_string(&*cache_lock).map(|json| std::fs::write(&cache_file_path, json));
     }
 
+    // Build local dependency graph
     let (local_graph, graph_mermaid) = {
-        let json = output_json.lock().unwrap();
+        let files = output_files.lock().unwrap();
         let mut edges = Vec::new();
         let mut mermaid = String::from("\n## Local Dependency Graph\n```mermaid\ngraph TD\n");
-        for (file_path, file_data) in json.iter() {
+        for (file_path, file_data) in files.iter() {
             let file_name = Path::new(file_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(file_path);
             for dep in &file_data.dependencies {
-                for target_path in json.keys() {
+                for target_path in files.keys() {
                     let target_name = Path::new(target_path)
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -317,17 +305,87 @@ async fn main() {
         None => Box::new(io::stdout()),
     };
 
-    if cli.format == Format::AgentMd || cli.format == Format::TreeOnly {
-        if cli.format == Format::AgentMd && !local_graph.is_empty() {
-            let mut md = output_md.lock().unwrap();
+    if cli.format == Format::AgentMd {
+        let files = output_files.lock().unwrap();
+        let total_files = files.len();
+        let total_focused = files.values().filter(|f| f.is_focused).count();
+
+        let mut md = String::new();
+        md.push_str("<!-- NOTE FOR AI: This is a structured, context-optimized codebase blueprint of the project.\n");
+        md.push_str("     Method/function bodies are stripped to save tokens. Use this to understand code architecture,\n");
+        md.push_str("     imports, and signatures. -->\n\n");
+        md.push_str("# Project Codebase Blueprint\n\n");
+
+        md.push_str("## Project Summary\n");
+        md.push_str(&format!("* **Scan Directory:** `{}`\n", cli.path));
+        md.push_str(&format!(
+            "* **Focused Path:** `{}`\n",
+            cli.focus.as_deref().unwrap_or("None")
+        ));
+        md.push_str(&format!("* **Total Files Scanned:** `{}`\n", total_files));
+        md.push_str(&format!(
+            "* **Total Focused Files:** `{}`\n\n",
+            total_focused
+        ));
+
+        md.push_str("| File Path | Focus | Signatures | Dependencies |\n");
+        md.push_str("|---|---|---|---|\n");
+        for (path, file) in files.iter() {
+            let focus_str = if file.is_focused {
+                "**Focused**"
+            } else {
+                "Out of Focus"
+            };
+            md.push_str(&format!(
+                "| `{}` | {} | {} | {} |\n",
+                path,
+                focus_str,
+                file.signatures.len(),
+                file.dependencies.len()
+            ));
+        }
+
+        if !local_graph.is_empty() {
             md.push_str(&graph_mermaid);
         }
-        let md = output_md.lock().unwrap();
+
+        md.push_str("\n## Codebase Structural Blueprint\n");
+        for (path, file) in files.iter() {
+            if file.is_focused && (!file.signatures.is_empty() || !file.dependencies.is_empty()) {
+                md.push_str(&format!("\n### [FOCUSED] File: {}\n", path));
+                if !file.dependencies.is_empty() {
+                    md.push_str("#### Dependencies:\n");
+                    for dep in &file.dependencies {
+                        md.push_str(&format!("- `{}`\n", dep));
+                    }
+                }
+                if !file.signatures.is_empty() {
+                    md.push_str("#### Signatures:\n");
+                    for sig in &file.signatures {
+                        md.push_str(&format!("- `{}`\n", sig));
+                    }
+                }
+            } else if !file.is_focused {
+                md.push_str(&format!("- [Out of focus] {}\n", path));
+            }
+        }
         write!(out, "{}", md).unwrap();
+    } else if cli.format == Format::TreeOnly {
+        let tree = output_tree.lock().unwrap();
+        write!(out, "{}", tree).unwrap();
     } else if cli.format == Format::AgentJson {
-        let json = output_json.lock().unwrap();
+        let files = output_files.lock().unwrap();
+        let total_files = files.len();
+        let total_focused = files.values().filter(|f| f.is_focused).count();
+
         let wrapper = AgentJsonOutput {
-            files: json.clone(),
+            project_metadata: ProjectMetadata {
+                scan_directory: cli.path.clone(),
+                focused_path: cli.focus.clone(),
+                total_files,
+                total_focused_files: total_focused,
+            },
+            files: files.clone(),
             local_dependency_graph: local_graph,
         };
         let json_str = serde_json::to_string_pretty(&wrapper).unwrap();
