@@ -1,13 +1,12 @@
-#![allow(clippy::collapsible_if)]
 use anyhow::{Context, Result};
 use clap::{
-    Parser, ValueEnum,
     builder::styling::{AnsiColor, Effects, Styles},
+    Parser, ValueEnum,
 };
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -109,15 +108,16 @@ async fn main() -> Result<()> {
 
     let depth_outside = cli.depth_outside;
     let focus_path_filter = focus_path_canon_str.clone();
+    let root_canon = std::fs::canonicalize(&cli.path).unwrap_or_else(|_| PathBuf::from(&cli.path));
+    let root_canon_clone = root_canon.clone();
+    let cli_path_str = cli.path.clone();
 
     let walker = WalkBuilder::new(&cli.path)
         .overrides(overrides)
         .filter_entry(move |e| {
             if let Some(focus) = &focus_path_filter {
-                let p = std::fs::canonicalize(e.path())
-                    .unwrap_or_else(|_| e.path().to_path_buf())
-                    .to_string_lossy()
-                    .to_string();
+                let rel = e.path().strip_prefix(&cli_path_str).unwrap_or(e.path());
+                let p = root_canon_clone.join(rel).to_string_lossy().to_string();
                 if p.starts_with(focus) || focus.starts_with(&p) {
                     return true;
                 }
@@ -170,8 +170,9 @@ async fn main() -> Result<()> {
 
             let path_str = path.display().to_string();
             let is_focused = if let Some(focus) = &focus_path_canon_str {
-                let p = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                p.to_string_lossy().to_string().starts_with(focus)
+                let rel = path.strip_prefix(&cli.path).unwrap_or(&path);
+                let p = root_canon.join(rel).to_string_lossy().to_string();
+                p.starts_with(focus)
             } else {
                 true
             };
@@ -286,13 +287,16 @@ async fn main() -> Result<()> {
         let mut edges = Vec::new();
         let mut mermaid = String::from("\n## Local Dependency Graph\n```mermaid\ngraph TD\n");
         let mut name_to_path = HashMap::new();
+        let mut safe_names = HashMap::new();
 
         for file_path in output_files.keys() {
             let file_name = Path::new(file_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(file_path);
-            name_to_path.insert(file_name.to_string(), file_path.clone());
+            let name_str = file_name.to_string();
+            name_to_path.insert(name_str.clone(), file_path.clone());
+            safe_names.insert(name_str, file_name.replace(['-', '.'], "_"));
         }
 
         for (file_path, file_data) in &output_files {
@@ -300,17 +304,24 @@ async fn main() -> Result<()> {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(file_path);
+            let safe_src = safe_names.get(file_name).unwrap();
+
+            let mut seen_deps = HashSet::new();
+
             for dep in &file_data.dependencies {
-                for (target_name, target_path) in &name_to_path {
-                    if file_path != target_path && contains_word_boundary(dep, target_name) {
-                        edges.push((file_path.clone(), target_path.clone()));
-                        let safe_src = file_name.replace(['-', '.'], "_");
-                        let safe_tgt = target_name.replace(['-', '.'], "_");
-                        mermaid.push_str(&format!(
-                            "  {}[\"{}\"] --> {}[\"{}\"]\n",
-                            safe_src, file_name, safe_tgt, target_name
-                        ));
-                        break;
+                for token in dep.split(|c: char| !c.is_alphanumeric()) {
+                    if token.is_empty() {
+                        continue;
+                    }
+                    if let Some(target_path) = name_to_path.get(token) {
+                        if file_path != target_path && seen_deps.insert(target_path.clone()) {
+                            edges.push((file_path.clone(), target_path.clone()));
+                            let safe_tgt = safe_names.get(token).unwrap();
+                            mermaid.push_str(&format!(
+                                "  {}[\"{}\"] --> {}[\"{}\"]\n",
+                                safe_src, file_name, safe_tgt, token
+                            ));
+                        }
                     }
                 }
             }
@@ -415,35 +426,6 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn contains_word_boundary(text: &str, word: &str) -> bool {
-    if text.is_empty() || word.is_empty() {
-        return false;
-    }
-    let mut start = 0;
-    while let Some(idx) = text[start..].find(word) {
-        let abs_idx = start + idx;
-        let before_is_boundary = abs_idx == 0
-            || !text[..abs_idx]
-                .chars()
-                .last()
-                .unwrap_or(' ')
-                .is_alphanumeric();
-        let after_idx = abs_idx + word.len();
-        let after_is_boundary = after_idx == text.len()
-            || !text[after_idx..]
-                .chars()
-                .next()
-                .unwrap_or(' ')
-                .is_alphanumeric();
-
-        if before_is_boundary && after_is_boundary {
-            return true;
-        }
-        start = abs_idx + word.len();
-    }
-    false
 }
 
 fn is_code_file(path: &Path) -> bool {
@@ -590,15 +572,12 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
         .any(|&k| cleaned.starts_with(k));
 
         if is_structural {
-            if let Some(brace_idx) = trimmed.find('{') {
-                let sig = trimmed[..brace_idx].trim().to_string();
-                if !sig.is_empty() {
-                    signatures.push(sig);
-                }
-            } else {
-                if !trimmed.is_empty() {
-                    signatures.push(trimmed.to_string());
-                }
+            let sig = match trimmed.find('{') {
+                Some(brace_idx) => trimmed[..brace_idx].trim(),
+                None => trimmed,
+            };
+            if !sig.is_empty() {
+                signatures.push(sig.to_string());
             }
         }
     }
