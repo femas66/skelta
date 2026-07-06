@@ -248,12 +248,10 @@ async fn main() -> Result<()> {
                             signatures: signatures.clone(),
                             dependencies: dependencies.clone(),
                         });
-                    } else if use_cache {
-                        if let Some(entry) = cache_arc_clone.get(&path_str) {
-                            let mut updated_entry = entry.clone();
-                            updated_entry.last_modified_timestamp = modified;
-                            new_cache_entry = Some(updated_entry);
-                        }
+                    } else if use_cache && let Some(entry) = cache_arc_clone.get(&path_str) {
+                        let mut updated_entry = entry.clone();
+                        updated_entry.last_modified_timestamp = modified;
+                        new_cache_entry = Some(updated_entry);
                     }
                 }
 
@@ -313,15 +311,16 @@ async fn main() -> Result<()> {
                     if token.is_empty() {
                         continue;
                     }
-                    if let Some(target_path) = name_to_path.get(token) {
-                        if file_path != target_path && seen_deps.insert(target_path.clone()) {
-                            edges.push((file_path.clone(), target_path.clone()));
-                            let safe_tgt = safe_names.get(token).unwrap();
-                            mermaid.push_str(&format!(
-                                "  {}[\"{}\"] --> {}[\"{}\"]\n",
-                                safe_src, file_name, safe_tgt, token
-                            ));
-                        }
+                    if let Some(target_path) = name_to_path.get(token)
+                        && file_path != target_path
+                        && seen_deps.insert(target_path.clone())
+                    {
+                        edges.push((file_path.clone(), target_path.clone()));
+                        let safe_tgt = safe_names.get(token).unwrap();
+                        mermaid.push_str(&format!(
+                            "  {}[\"{}\"] --> {}[\"{}\"]\n",
+                            safe_src, file_name, safe_tgt, token
+                        ));
                     }
                 }
             }
@@ -508,22 +507,21 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
         _ => (None, &[], &[], &[]),
     };
 
-    if let Some(language) = lang {
-        if parser.set_language(&language).is_ok() {
-            if let Some(tree) = parser.parse(content, None) {
-                let mut cursor = tree.walk();
-                extract_ast_nodes(
-                    content.as_bytes(),
-                    &mut cursor,
-                    dep_types,
-                    sig_types_body,
-                    sig_types_no_body,
-                    &mut signatures,
-                    &mut dependencies,
-                );
-                return (signatures, dependencies);
-            }
-        }
+    if let Some(language) = lang
+        && parser.set_language(&language).is_ok()
+        && let Some(tree) = parser.parse(content, None)
+    {
+        let mut cursor = tree.walk();
+        extract_ast_nodes(
+            content.as_bytes(),
+            &mut cursor,
+            dep_types,
+            sig_types_body,
+            sig_types_no_body,
+            &mut signatures,
+            &mut dependencies,
+        );
+        return (signatures, dependencies);
     }
 
     // Fallback regex
@@ -608,10 +606,10 @@ fn extract_ast_nodes(
             if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
                 signatures.push(sig.trim().to_string());
             }
-        } else if sig_types_no_body.contains(&kind) {
-            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
-                signatures.push(sig.trim().to_string());
-            }
+        } else if sig_types_no_body.contains(&kind)
+            && let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()])
+        {
+            signatures.push(sig.trim().to_string());
         }
         if cursor.goto_first_child() {
             extract_ast_nodes(
