@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::fs;
@@ -67,9 +67,9 @@ struct ProjectMetadata {
 }
 
 #[derive(Serialize)]
-struct AgentJsonOutput {
+struct AgentJsonOutput<'a> {
     project_metadata: ProjectMetadata,
-    files: BTreeMap<String, AgentJsonFile>,
+    files: &'a BTreeMap<String, AgentJsonFile>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     local_dependency_graph: Vec<(String, String)>,
 }
@@ -95,22 +95,26 @@ async fn main() {
         .build()
         .unwrap_or_else(|_| OverrideBuilder::new(&cli.path).build().unwrap());
 
-    let output_tree = Arc::new(Mutex::new(String::new()));
-    let output_files = Arc::new(Mutex::new(BTreeMap::new()));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
 
-    let focus_path = cli
-        .focus
-        .as_ref()
-        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| Path::new(p).to_path_buf()));
-    let depth_outside = cli.depth_outside;
+    let focus_path_canon_str = cli.focus.as_ref().map(|p| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| PathBuf::from(p))
+            .to_string_lossy()
+            .to_string()
+    });
 
-    let focus_path_filter = focus_path.clone();
+    let depth_outside = cli.depth_outside;
+    let focus_path_filter = focus_path_canon_str.clone();
+
     let walker = WalkBuilder::new(&cli.path)
         .overrides(overrides)
         .filter_entry(move |e| {
             if let Some(focus) = &focus_path_filter {
-                let p = std::fs::canonicalize(e.path()).unwrap_or_else(|_| e.path().to_path_buf());
+                let p = std::fs::canonicalize(e.path())
+                    .unwrap_or_else(|_| e.path().to_path_buf())
+                    .to_string_lossy()
+                    .to_string();
                 if p.starts_with(focus) || focus.starts_with(&p) {
                     return true;
                 }
@@ -141,6 +145,7 @@ async fn main() {
     let cache_arc = Arc::new(Mutex::new(cache_data));
 
     let mut tasks = vec![];
+    let mut output_tree = String::new();
 
     for entry in walker.flatten() {
         let format = cli.format.clone();
@@ -149,8 +154,7 @@ async fn main() {
             let name = entry.file_name().to_string_lossy().to_string();
             let indent = "  ".repeat(if depth > 0 { depth - 1 } else { 0 });
             let prefix = if depth > 0 { "├── " } else { "" };
-            let mut out_md = output_tree.lock().unwrap();
-            out_md.push_str(&format!("{}{}{}\n", indent, prefix, name));
+            output_tree.push_str(&format!("{}{}{}\n", indent, prefix, name));
             continue;
         }
 
@@ -160,20 +164,19 @@ async fn main() {
                 continue;
             }
 
-            let is_focused = if let Some(focus) = &focus_path {
+            let path_str = path.display().to_string();
+            let is_focused = if let Some(focus) = &focus_path_canon_str {
                 let p = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                p.starts_with(focus)
+                p.to_string_lossy().to_string().starts_with(focus)
             } else {
                 true
             };
 
-            let out_files_clone = Arc::clone(&output_files);
             let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
             let cache_arc_clone = Arc::clone(&cache_arc);
 
             tasks.push(tokio::spawn(async move {
                 let _permit = permit;
-                let path_str = path.display().to_string();
                 let mut signatures = Vec::new();
                 let mut dependencies = Vec::new();
 
@@ -215,7 +218,10 @@ async fn main() {
                             let entry = cache_lock.get(&path_str).unwrap();
                             (entry.signatures.clone(), entry.dependencies.clone())
                         } else {
-                            process_file(&path_str, &content)
+                            let path_clone = path_str.clone();
+                            tokio::task::spawn_blocking(move || process_file(&path_clone, &content))
+                                .await
+                                .unwrap_or_default()
                         }
                     } else {
                         (Vec::new(), Vec::new())
@@ -242,42 +248,49 @@ async fn main() {
                     }
                 }
 
-                let mut out_lock = out_files_clone.lock().unwrap();
-                out_lock.insert(
-                    path_str,
-                    AgentJsonFile {
-                        is_focused,
-                        signatures,
-                        dependencies,
-                    },
-                );
+                (path_str, AgentJsonFile {
+                    is_focused,
+                    signatures,
+                    dependencies,
+                })
             }));
         }
     }
 
-    futures_util::future::join_all(tasks).await;
+    let mut output_files = BTreeMap::new();
+    let results = futures_util::future::join_all(tasks).await;
+    for res in results {
+        if let Ok((path_str, file_data)) = res {
+            output_files.insert(path_str, file_data);
+        }
+    }
 
     if let Ok(cache_lock) = cache_arc.lock() {
         let _ =
             serde_json::to_string(&*cache_lock).map(|json| std::fs::write(&cache_file_path, json));
     }
 
-    // Build local dependency graph
+    // Build local dependency graph O(N)
     let (local_graph, graph_mermaid) = {
-        let files = output_files.lock().unwrap();
         let mut edges = Vec::new();
         let mut mermaid = String::from("\n## Local Dependency Graph\n```mermaid\ngraph TD\n");
-        for (file_path, file_data) in files.iter() {
+        let mut name_to_path = HashMap::new();
+        
+        for file_path in output_files.keys() {
+            let file_name = Path::new(file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(file_path);
+            name_to_path.insert(file_name.to_string(), file_path.clone());
+        }
+
+        for (file_path, file_data) in &output_files {
             let file_name = Path::new(file_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(file_path);
             for dep in &file_data.dependencies {
-                for target_path in files.keys() {
-                    let target_name = Path::new(target_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(target_path);
+                for (target_name, target_path) in &name_to_path {
                     if dep.contains(target_name) && file_path != target_path {
                         edges.push((file_path.clone(), target_path.clone()));
                         let safe_src = file_name.replace(['-', '.'], "_");
@@ -306,9 +319,8 @@ async fn main() {
     };
 
     if cli.format == Format::AgentMd {
-        let files = output_files.lock().unwrap();
-        let total_files = files.len();
-        let total_focused = files.values().filter(|f| f.is_focused).count();
+        let total_files = output_files.len();
+        let total_focused = output_files.values().filter(|f| f.is_focused).count();
 
         let mut md = String::new();
         md.push_str("<!-- NOTE FOR AI: This is a structured, context-optimized codebase blueprint of the project.\n");
@@ -330,7 +342,7 @@ async fn main() {
 
         md.push_str("| File Path | Focus | Signatures | Dependencies |\n");
         md.push_str("|---|---|---|---|\n");
-        for (path, file) in files.iter() {
+        for (path, file) in output_files.iter() {
             let focus_str = if file.is_focused {
                 "**Focused**"
             } else {
@@ -350,7 +362,7 @@ async fn main() {
         }
 
         md.push_str("\n## Codebase Structural Blueprint\n");
-        for (path, file) in files.iter() {
+        for (path, file) in output_files.iter() {
             if file.is_focused && (!file.signatures.is_empty() || !file.dependencies.is_empty()) {
                 md.push_str(&format!("\n### [FOCUSED] File: {}\n", path));
                 if !file.dependencies.is_empty() {
@@ -371,12 +383,10 @@ async fn main() {
         }
         write!(out, "{}", md).unwrap();
     } else if cli.format == Format::TreeOnly {
-        let tree = output_tree.lock().unwrap();
-        write!(out, "{}", tree).unwrap();
+        write!(out, "{}", output_tree).unwrap();
     } else if cli.format == Format::AgentJson {
-        let files = output_files.lock().unwrap();
-        let total_files = files.len();
-        let total_focused = files.values().filter(|f| f.is_focused).count();
+        let total_files = output_files.len();
+        let total_focused = output_files.values().filter(|f| f.is_focused).count();
 
         let wrapper = AgentJsonOutput {
             project_metadata: ProjectMetadata {
@@ -385,7 +395,7 @@ async fn main() {
                 total_files,
                 total_focused_files: total_focused,
             },
-            files: files.clone(),
+            files: &output_files,
             local_dependency_graph: local_graph,
         };
         let json_str = serde_json::to_string_pretty(&wrapper).unwrap();
@@ -429,57 +439,30 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
     let mut dependencies = Vec::new();
     if path.ends_with(".rs") {
         let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .is_ok()
-        {
-            let tree = parser
-                .parse(content, None)
-                .unwrap_or_else(|| panic!("Failed to parse Rust: {}", path));
-            let mut cursor = tree.walk();
-            extract_rust_sigs(
-                content.as_bytes(),
-                &mut cursor,
-                &mut signatures,
-                &mut dependencies,
-            );
-            return (signatures, dependencies);
+        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_ok() {
+            if let Some(tree) = parser.parse(content, None) {
+                let mut cursor = tree.walk();
+                extract_rust_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                return (signatures, dependencies);
+            }
         }
     } else if path.ends_with(".py") {
         let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .is_ok()
-        {
-            let tree = parser
-                .parse(content, None)
-                .unwrap_or_else(|| panic!("Failed to parse Python: {}", path));
-            let mut cursor = tree.walk();
-            extract_python_sigs(
-                content.as_bytes(),
-                &mut cursor,
-                &mut signatures,
-                &mut dependencies,
-            );
-            return (signatures, dependencies);
+        if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_ok() {
+            if let Some(tree) = parser.parse(content, None) {
+                let mut cursor = tree.walk();
+                extract_python_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                return (signatures, dependencies);
+            }
         }
     } else if path.ends_with(".go") {
         let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_go::LANGUAGE.into())
-            .is_ok()
-        {
-            let tree = parser
-                .parse(content, None)
-                .unwrap_or_else(|| panic!("Failed to parse Go: {}", path));
-            let mut cursor = tree.walk();
-            extract_go_sigs(
-                content.as_bytes(),
-                &mut cursor,
-                &mut signatures,
-                &mut dependencies,
-            );
-            return (signatures, dependencies);
+        if parser.set_language(&tree_sitter_go::LANGUAGE.into()).is_ok() {
+            if let Some(tree) = parser.parse(content, None) {
+                let mut cursor = tree.walk();
+                extract_go_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                return (signatures, dependencies);
+            }
         }
     } else if path.ends_with(".js")
         || path.ends_with(".jsx")
@@ -487,23 +470,16 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
         || path.ends_with(".tsx")
     {
         let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .is_ok()
-        {
-            let tree = parser
-                .parse(content, None)
-                .unwrap_or_else(|| panic!("Failed to parse JS: {}", path));
-            let mut cursor = tree.walk();
-            extract_js_sigs(
-                content.as_bytes(),
-                &mut cursor,
-                &mut signatures,
-                &mut dependencies,
-            );
-            return (signatures, dependencies);
+        if parser.set_language(&tree_sitter_javascript::LANGUAGE.into()).is_ok() {
+            if let Some(tree) = parser.parse(content, None) {
+                let mut cursor = tree.walk();
+                extract_js_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                return (signatures, dependencies);
+            }
         }
     }
+    
+    // Fallback regex
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("import ")
