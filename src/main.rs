@@ -28,27 +28,16 @@ fn cli_styles() -> Styles {
 #[command(about = "A fast code structural blueprinter", long_about = None)]
 #[command(styles = cli_styles())]
 struct Cli {
-    /// The directory to scan (defaults to current directory './')
     #[arg(default_value = "./")]
     path: String,
-
-    /// Output format
     #[arg(long, value_enum, default_value_t = Format::AgentMd)]
     format: Format,
-
-    /// Specific output file (defaults to stdout if not provided)
     #[arg(long)]
     out: Option<String>,
-
-    /// Exclude specific file patterns (e.g., "*.md")
     #[arg(long)]
     exclude: Vec<String>,
-
-    /// Specifies the file or directory that requires high-granularity extraction.
     #[arg(long)]
     focus: Option<String>,
-
-    /// Specifies how deep the directory tree should be visualized for areas outside the focus window.
     #[arg(long, default_value_t = 2)]
     depth_outside: usize,
 }
@@ -65,11 +54,15 @@ struct AgentJsonFile {
     is_focused: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     signatures: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dependencies: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct AgentJsonOutput {
     files: BTreeMap<String, AgentJsonFile>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    local_dependency_graph: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -77,6 +70,8 @@ struct CacheEntry {
     sha256_hash: String,
     last_modified_timestamp: u64,
     signatures: Vec<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 #[tokio::main]
@@ -93,7 +88,7 @@ async fn main() {
 
     let output_md = Arc::new(Mutex::new(String::new()));
     let output_json = Arc::new(Mutex::new(BTreeMap::new()));
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(64)); // bound concurrency
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
 
     let focus_path = cli
         .focus
@@ -120,7 +115,6 @@ async fn main() {
         })
         .build();
 
-    // Load Cache
     let path_meta = std::fs::metadata(&cli.path).ok();
     let cache_dir = if path_meta.as_ref().is_some_and(|m| m.is_dir()) {
         Path::new(&cli.path).to_path_buf()
@@ -141,7 +135,6 @@ async fn main() {
 
     for entry in walker.flatten() {
         let format = cli.format.clone();
-
         if format == Format::TreeOnly {
             let depth = entry.depth();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -154,8 +147,7 @@ async fn main() {
 
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
             let path = entry.path().to_path_buf();
-
-            if format != Format::TreeOnly && !is_code_file(&path) {
+            if !is_code_file(&path) {
                 continue;
             }
 
@@ -174,8 +166,8 @@ async fn main() {
             tasks.push(tokio::spawn(async move {
                 let _permit = permit;
                 let path_str = path.display().to_string();
-
                 let mut signatures = Vec::new();
+                let mut dependencies = Vec::new();
 
                 if is_focused {
                     let metadata = fs::metadata(&path).await.ok();
@@ -187,6 +179,7 @@ async fn main() {
 
                     let mut use_cache = false;
                     let mut cached_sigs = None;
+                    let mut cached_deps = None;
                     let mut cached_hash = String::new();
 
                     {
@@ -196,13 +189,14 @@ async fn main() {
                             if entry.last_modified_timestamp == modified && modified > 0 {
                                 use_cache = true;
                                 cached_sigs = Some(entry.signatures.clone());
+                                cached_deps = Some(entry.dependencies.clone());
                             }
                         }
                     }
 
                     let mut file_hash = String::new();
-                    signatures = if use_cache {
-                        cached_sigs.unwrap()
+                    let (sigs, deps) = if use_cache {
+                        (cached_sigs.unwrap(), cached_deps.unwrap_or_default())
                     } else if let Ok(content) = fs::read_to_string(&path).await {
                         let mut hasher = Sha256::new();
                         hasher.update(content.as_bytes());
@@ -210,13 +204,16 @@ async fn main() {
 
                         if file_hash == cached_hash && !cached_hash.is_empty() {
                             let cache_lock = cache_arc_clone.lock().unwrap();
-                            cache_lock.get(&path_str).unwrap().signatures.clone()
+                            let entry = cache_lock.get(&path_str).unwrap();
+                            (entry.signatures.clone(), entry.dependencies.clone())
                         } else {
                             process_file(&path_str, &content)
                         }
                     } else {
-                        Vec::new()
+                        (Vec::new(), Vec::new())
                     };
+                    signatures = sigs;
+                    dependencies = deps;
 
                     if !file_hash.is_empty() {
                         let mut cache_lock = cache_arc_clone.lock().unwrap();
@@ -226,6 +223,7 @@ async fn main() {
                                 sha256_hash: file_hash,
                                 last_modified_timestamp: modified,
                                 signatures: signatures.clone(),
+                                dependencies: dependencies.clone(),
                             },
                         );
                     } else if use_cache {
@@ -238,10 +236,19 @@ async fn main() {
 
                 if format == Format::AgentMd {
                     let mut md = out_md_clone.lock().unwrap();
-                    if is_focused && !signatures.is_empty() {
+                    if is_focused && (!signatures.is_empty() || !dependencies.is_empty()) {
                         md.push_str(&format!("\n### [FOCUSED] File: {}\n", path_str));
-                        for sig in &signatures {
-                            md.push_str(&format!("- `{}`\n", sig));
+                        if !dependencies.is_empty() {
+                            md.push_str("#### Dependencies:\n");
+                            for dep in &dependencies {
+                                md.push_str(&format!("- `{}`\n", dep));
+                            }
+                        }
+                        if !signatures.is_empty() {
+                            md.push_str("#### Signatures:\n");
+                            for sig in &signatures {
+                                md.push_str(&format!("- `{}`\n", sig));
+                            }
                         }
                     } else if !is_focused {
                         md.push_str(&format!("- [Out of focus] {}\n", path_str));
@@ -253,6 +260,7 @@ async fn main() {
                         AgentJsonFile {
                             is_focused,
                             signatures,
+                            dependencies,
                         },
                     );
                 }
@@ -262,11 +270,42 @@ async fn main() {
 
     futures_util::future::join_all(tasks).await;
 
-    // Save cache
     if let Ok(cache_lock) = cache_arc.lock() {
         let _ =
             serde_json::to_string(&*cache_lock).map(|json| std::fs::write(&cache_file_path, json));
     }
+
+    let (local_graph, graph_mermaid) = {
+        let json = output_json.lock().unwrap();
+        let mut edges = Vec::new();
+        let mut mermaid = String::from("\n## Local Dependency Graph\n```mermaid\ngraph TD\n");
+        for (file_path, file_data) in json.iter() {
+            let file_name = Path::new(file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(file_path);
+            for dep in &file_data.dependencies {
+                for target_path in json.keys() {
+                    let target_name = Path::new(target_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(target_path);
+                    if dep.contains(target_name) && file_path != target_path {
+                        edges.push((file_path.clone(), target_path.clone()));
+                        let safe_src = file_name.replace(['-', '.'], "_");
+                        let safe_tgt = target_name.replace(['-', '.'], "_");
+                        mermaid.push_str(&format!(
+                            "  {}[\"{}\"] --> {}[\"{}\"]\n",
+                            safe_src, file_name, safe_tgt, target_name
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        mermaid.push_str("```\n");
+        (edges, mermaid)
+    };
 
     let mut out: Box<dyn Write> = match cli.out {
         Some(ref p) => {
@@ -279,19 +318,23 @@ async fn main() {
     };
 
     if cli.format == Format::AgentMd || cli.format == Format::TreeOnly {
+        if cli.format == Format::AgentMd && !local_graph.is_empty() {
+            let mut md = output_md.lock().unwrap();
+            md.push_str(&graph_mermaid);
+        }
         let md = output_md.lock().unwrap();
         write!(out, "{}", md).unwrap();
     } else if cli.format == Format::AgentJson {
         let json = output_json.lock().unwrap();
         let wrapper = AgentJsonOutput {
             files: json.clone(),
+            local_dependency_graph: local_graph,
         };
         let json_str = serde_json::to_string_pretty(&wrapper).unwrap();
         writeln!(out, "{}", json_str).unwrap();
     }
 }
 
-// ponytail: basic extension filter
 fn is_code_file(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         matches!(
@@ -323,27 +366,95 @@ fn is_code_file(path: &Path) -> bool {
     }
 }
 
-// ponytail: tree-sitter integration for Rust. Other languages fallback to basic parser.
-fn process_file(path: &str, content: &str) -> Vec<String> {
+fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
+    let mut signatures = Vec::new();
+    let mut dependencies = Vec::new();
     if path.ends_with(".rs") {
         let mut parser = tree_sitter::Parser::new();
-        parser
+        if parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .expect("Error loading Rust grammar");
-        let tree = parser.parse(content, None).unwrap();
-        let mut cursor = tree.walk();
-
-        let mut signatures = Vec::new();
-        extract_rust_signatures(content.as_bytes(), &mut cursor, &mut signatures);
-        return signatures;
+            .is_ok()
+        {
+            let tree = parser
+                .parse(content, None)
+                .unwrap_or_else(|| panic!("Failed to parse Rust: {}", path));
+            let mut cursor = tree.walk();
+            extract_rust_sigs(
+                content.as_bytes(),
+                &mut cursor,
+                &mut signatures,
+                &mut dependencies,
+            );
+            return (signatures, dependencies);
+        }
+    } else if path.ends_with(".py") {
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .is_ok()
+        {
+            let tree = parser
+                .parse(content, None)
+                .unwrap_or_else(|| panic!("Failed to parse Python: {}", path));
+            let mut cursor = tree.walk();
+            extract_python_sigs(
+                content.as_bytes(),
+                &mut cursor,
+                &mut signatures,
+                &mut dependencies,
+            );
+            return (signatures, dependencies);
+        }
+    } else if path.ends_with(".go") {
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .is_ok()
+        {
+            let tree = parser
+                .parse(content, None)
+                .unwrap_or_else(|| panic!("Failed to parse Go: {}", path));
+            let mut cursor = tree.walk();
+            extract_go_sigs(
+                content.as_bytes(),
+                &mut cursor,
+                &mut signatures,
+                &mut dependencies,
+            );
+            return (signatures, dependencies);
+        }
+    } else if path.ends_with(".js")
+        || path.ends_with(".jsx")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
+    {
+        let mut parser = tree_sitter::Parser::new();
+        if parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .is_ok()
+        {
+            let tree = parser
+                .parse(content, None)
+                .unwrap_or_else(|| panic!("Failed to parse JS: {}", path));
+            let mut cursor = tree.walk();
+            extract_js_sigs(
+                content.as_bytes(),
+                &mut cursor,
+                &mut signatures,
+                &mut dependencies,
+            );
+            return (signatures, dependencies);
+        }
     }
-
-    // Fallback parser
-    let mut signatures = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
-
-        // Strip common access/export modifiers in any order safely
+        if trimmed.starts_with("import ")
+            || trimmed.starts_with("require(")
+            || trimmed.starts_with("from ")
+        {
+            dependencies.push(trimmed.to_string());
+            continue;
+        }
         let mut cleaned = trimmed;
         let mut changed = true;
         while changed {
@@ -365,7 +476,6 @@ fn process_file(path: &str, content: &str) -> Vec<String> {
                 }
             }
         }
-
         let is_structural = [
             "fn ",
             "func ",
@@ -379,25 +489,28 @@ fn process_file(path: &str, content: &str) -> Vec<String> {
         ]
         .iter()
         .any(|&k| cleaned.starts_with(k));
-
         if is_structural && trimmed.contains("{") {
             let sig = trimmed.split('{').next().unwrap().trim().to_string();
             signatures.push(sig);
         }
     }
-    signatures
+    (signatures, dependencies)
 }
 
-fn extract_rust_signatures(
+fn extract_rust_sigs(
     content: &[u8],
     cursor: &mut tree_sitter::TreeCursor,
     signatures: &mut Vec<String>,
+    dependencies: &mut Vec<String>,
 ) {
     loop {
         let node = cursor.node();
         let kind = node.kind();
-
-        if kind == "function_item"
+        if kind == "use_declaration" {
+            if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
+                dependencies.push(dep.trim().to_string());
+            }
+        } else if kind == "function_item"
             || kind == "struct_item"
             || kind == "impl_item"
             || kind == "trait_item"
@@ -405,26 +518,119 @@ fn extract_rust_signatures(
             let mut sig_end = node.end_byte();
             if let Some(block) = node.child_by_field_name("body") {
                 sig_end = block.start_byte();
-            } else {
-                for i in 0..node.child_count() {
-                    let child = node.child(i as u32).unwrap();
-                    if child.kind() == "block" || child.kind() == "declaration_list" {
-                        sig_end = child.start_byte();
-                        break;
-                    }
-                }
             }
-
             if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
                 signatures.push(sig.trim().to_string());
             }
         }
-
         if cursor.goto_first_child() {
-            extract_rust_signatures(content, cursor, signatures);
+            extract_rust_sigs(content, cursor, signatures, dependencies);
             cursor.goto_parent();
         }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
 
+fn extract_python_sigs(
+    content: &[u8],
+    cursor: &mut tree_sitter::TreeCursor,
+    signatures: &mut Vec<String>,
+    dependencies: &mut Vec<String>,
+) {
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if kind == "import_statement" || kind == "import_from_statement" {
+            if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
+                dependencies.push(dep.trim().to_string());
+            }
+        } else if kind == "function_definition" || kind == "class_definition" {
+            let mut sig_end = node.end_byte();
+            if let Some(body) = node.child_by_field_name("body") {
+                sig_end = body.start_byte();
+            }
+            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
+                signatures.push(sig.trim().to_string());
+            }
+        }
+        if cursor.goto_first_child() {
+            extract_python_sigs(content, cursor, signatures, dependencies);
+            cursor.goto_parent();
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn extract_go_sigs(
+    content: &[u8],
+    cursor: &mut tree_sitter::TreeCursor,
+    signatures: &mut Vec<String>,
+    dependencies: &mut Vec<String>,
+) {
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if kind == "import_declaration" {
+            if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
+                dependencies.push(dep.trim().to_string());
+            }
+        } else if kind == "function_declaration" || kind == "method_declaration" {
+            let mut sig_end = node.end_byte();
+            if let Some(body) = node.child_by_field_name("body") {
+                sig_end = body.start_byte();
+            }
+            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
+                signatures.push(sig.trim().to_string());
+            }
+        } else if kind == "type_declaration" {
+            let bytes = &content[node.start_byte()..node.end_byte()];
+            if let Ok(sig) = std::str::from_utf8(bytes) {
+                signatures.push(sig.trim().to_string());
+            }
+        }
+        if cursor.goto_first_child() {
+            extract_go_sigs(content, cursor, signatures, dependencies);
+            cursor.goto_parent();
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn extract_js_sigs(
+    content: &[u8],
+    cursor: &mut tree_sitter::TreeCursor,
+    signatures: &mut Vec<String>,
+    dependencies: &mut Vec<String>,
+) {
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if kind == "import_statement" || kind == "export_statement" {
+            if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
+                dependencies.push(dep.trim().to_string());
+            }
+        } else if kind == "function_declaration"
+            || kind == "class_declaration"
+            || kind == "method_definition"
+        {
+            let mut sig_end = node.end_byte();
+            if let Some(body) = node.child_by_field_name("body") {
+                sig_end = body.start_byte();
+            }
+            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
+                signatures.push(sig.trim().to_string());
+            }
+        }
+        if cursor.goto_first_child() {
+            extract_js_sigs(content, cursor, signatures, dependencies);
+            cursor.goto_parent();
+        }
         if !cursor.goto_next_sibling() {
             break;
         }

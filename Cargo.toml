@@ -12,4 +12,7 @@ serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
 tree-sitter = "0.26.10"
 tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-python = "0.23.2"
+tree-sitter-go = "0.23.0"
 sha2 = "0.10.8"
