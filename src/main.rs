@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{
-    builder::styling::{AnsiColor, Effects, Styles},
     Parser, ValueEnum,
+    builder::styling::{AnsiColor, Effects, Styles},
 };
-use ignore::{overrides::OverrideBuilder, WalkBuilder};
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
