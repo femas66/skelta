@@ -43,6 +43,14 @@ struct Cli {
     /// Exclude specific file patterns (e.g., "*.md")
     #[arg(long)]
     exclude: Vec<String>,
+
+    /// Specifies the file or directory that requires high-granularity extraction.
+    #[arg(long)]
+    focus: Option<String>,
+
+    /// Specifies how deep the directory tree should be visualized for areas outside the focus window.
+    #[arg(long, default_value_t = 2)]
+    depth_outside: usize,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
@@ -52,9 +60,16 @@ enum Format {
     TreeOnly,
 }
 
+#[derive(Serialize, Clone)]
+struct AgentJsonFile {
+    is_focused: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    signatures: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct AgentJsonOutput {
-    files: BTreeMap<String, Vec<String>>,
+    files: BTreeMap<String, AgentJsonFile>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -76,11 +91,34 @@ async fn main() {
         .build()
         .unwrap_or_else(|_| OverrideBuilder::new(&cli.path).build().unwrap());
 
-    let walker = WalkBuilder::new(&cli.path).overrides(overrides).build();
-
     let output_md = Arc::new(Mutex::new(String::new()));
     let output_json = Arc::new(Mutex::new(BTreeMap::new()));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(64)); // bound concurrency
+
+    let focus_path = cli
+        .focus
+        .as_ref()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| Path::new(p).to_path_buf()));
+    let depth_outside = cli.depth_outside;
+
+    let focus_path_filter = focus_path.clone();
+    let walker = WalkBuilder::new(&cli.path)
+        .overrides(overrides)
+        .filter_entry(move |e| {
+            if let Some(focus) = &focus_path_filter {
+                let p = std::fs::canonicalize(e.path()).unwrap_or_else(|_| e.path().to_path_buf());
+                if p.starts_with(focus) || focus.starts_with(&p) {
+                    return true;
+                }
+                if e.depth() <= depth_outside {
+                    return true;
+                }
+                false
+            } else {
+                true
+            }
+        })
+        .build();
 
     // Load Cache
     let path_meta = std::fs::metadata(&cli.path).ok();
@@ -121,6 +159,13 @@ async fn main() {
                 continue;
             }
 
+            let is_focused = if let Some(focus) = &focus_path {
+                let p = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                p.starts_with(focus)
+            } else {
+                true
+            };
+
             let out_md_clone = Arc::clone(&output_md);
             let out_json_clone = Arc::clone(&output_json);
             let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
@@ -130,77 +175,86 @@ async fn main() {
                 let _permit = permit;
                 let path_str = path.display().to_string();
 
-                let metadata = fs::metadata(&path).await.ok();
-                let modified = metadata
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let mut signatures = Vec::new();
 
-                let mut use_cache = false;
-                let mut cached_sigs = None;
-                let mut cached_hash = String::new();
+                if is_focused {
+                    let metadata = fs::metadata(&path).await.ok();
+                    let modified = metadata
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
 
-                {
-                    let cache_lock = cache_arc_clone.lock().unwrap();
-                    if let Some(entry) = cache_lock.get(&path_str) {
-                        cached_hash = entry.sha256_hash.clone();
-                        if entry.last_modified_timestamp == modified && modified > 0 {
-                            use_cache = true;
-                            cached_sigs = Some(entry.signatures.clone());
+                    let mut use_cache = false;
+                    let mut cached_sigs = None;
+                    let mut cached_hash = String::new();
+
+                    {
+                        let cache_lock = cache_arc_clone.lock().unwrap();
+                        if let Some(entry) = cache_lock.get(&path_str) {
+                            cached_hash = entry.sha256_hash.clone();
+                            if entry.last_modified_timestamp == modified && modified > 0 {
+                                use_cache = true;
+                                cached_sigs = Some(entry.signatures.clone());
+                            }
+                        }
+                    }
+
+                    let mut file_hash = String::new();
+                    signatures = if use_cache {
+                        cached_sigs.unwrap()
+                    } else if let Ok(content) = fs::read_to_string(&path).await {
+                        let mut hasher = Sha256::new();
+                        hasher.update(content.as_bytes());
+                        file_hash = format!("{:x}", hasher.finalize());
+
+                        if file_hash == cached_hash && !cached_hash.is_empty() {
+                            let cache_lock = cache_arc_clone.lock().unwrap();
+                            cache_lock.get(&path_str).unwrap().signatures.clone()
+                        } else {
+                            process_file(&path_str, &content)
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    if !file_hash.is_empty() {
+                        let mut cache_lock = cache_arc_clone.lock().unwrap();
+                        cache_lock.insert(
+                            path_str.clone(),
+                            CacheEntry {
+                                sha256_hash: file_hash,
+                                last_modified_timestamp: modified,
+                                signatures: signatures.clone(),
+                            },
+                        );
+                    } else if use_cache {
+                        let mut cache_lock = cache_arc_clone.lock().unwrap();
+                        if let Some(entry) = cache_lock.get_mut(&path_str) {
+                            entry.last_modified_timestamp = modified;
                         }
                     }
                 }
 
-                let mut file_hash = String::new();
-                let signatures = if use_cache {
-                    cached_sigs.unwrap()
-                } else if let Ok(content) = fs::read_to_string(&path).await {
-                    let mut hasher = Sha256::new();
-                    hasher.update(content.as_bytes());
-                    file_hash = format!("{:x}", hasher.finalize());
-
-                    if file_hash == cached_hash && !cached_hash.is_empty() {
-                        // Hash matches, just metadata was updated
-                        let cache_lock = cache_arc_clone.lock().unwrap();
-                        cache_lock.get(&path_str).unwrap().signatures.clone()
-                    } else {
-                        process_file(&path_str, &content)
-                    }
-                } else {
-                    Vec::new()
-                };
-
-                if !file_hash.is_empty() {
-                    let mut cache_lock = cache_arc_clone.lock().unwrap();
-                    cache_lock.insert(
-                        path_str.clone(),
-                        CacheEntry {
-                            sha256_hash: file_hash,
-                            last_modified_timestamp: modified,
-                            signatures: signatures.clone(),
-                        },
-                    );
-                } else if use_cache {
-                    // Update timestamp just in case
-                    let mut cache_lock = cache_arc_clone.lock().unwrap();
-                    if let Some(entry) = cache_lock.get_mut(&path_str) {
-                        entry.last_modified_timestamp = modified;
-                    }
-                }
-
-                if !signatures.is_empty() {
-                    if format == Format::AgentMd {
-                        let mut md = out_md_clone.lock().unwrap();
-                        md.push_str(&format!("### File: {}\n", path_str));
-                        for sig in signatures {
+                if format == Format::AgentMd {
+                    let mut md = out_md_clone.lock().unwrap();
+                    if is_focused && !signatures.is_empty() {
+                        md.push_str(&format!("\n### [FOCUSED] File: {}\n", path_str));
+                        for sig in &signatures {
                             md.push_str(&format!("- `{}`\n", sig));
                         }
-                        md.push('\n');
-                    } else if format == Format::AgentJson {
-                        let mut json = out_json_clone.lock().unwrap();
-                        json.insert(path_str, signatures);
+                    } else if !is_focused {
+                        md.push_str(&format!("- [Out of focus] {}\n", path_str));
                     }
+                } else if format == Format::AgentJson {
+                    let mut json = out_json_clone.lock().unwrap();
+                    json.insert(
+                        path_str,
+                        AgentJsonFile {
+                            is_focused,
+                            signatures,
+                        },
+                    );
                 }
             }));
         }
