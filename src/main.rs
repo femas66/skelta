@@ -1,10 +1,10 @@
 #![allow(clippy::collapsible_if)]
 use anyhow::{Context, Result};
 use clap::{
-    builder::styling::{AnsiColor, Effects, Styles},
     Parser, ValueEnum,
+    builder::styling::{AnsiColor, Effects, Styles},
 };
-use ignore::{overrides::OverrideBuilder, WalkBuilder};
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -426,9 +426,19 @@ fn contains_word_boundary(text: &str, word: &str) -> bool {
     let mut start = 0;
     while let Some(idx) = text[start..].find(word) {
         let abs_idx = start + idx;
-        let before_is_boundary = abs_idx == 0 || !text[..abs_idx].chars().last().unwrap_or(' ').is_alphanumeric();
+        let before_is_boundary = abs_idx == 0
+            || !text[..abs_idx]
+                .chars()
+                .last()
+                .unwrap_or(' ')
+                .is_alphanumeric();
         let after_idx = abs_idx + word.len();
-        let after_is_boundary = after_idx == text.len() || !text[after_idx..].chars().next().unwrap_or(' ').is_alphanumeric();
+        let after_is_boundary = after_idx == text.len()
+            || !text[after_idx..]
+                .chars()
+                .next()
+                .unwrap_or(' ')
+                .is_alphanumeric();
 
         if before_is_boundary && after_is_boundary {
             return true;
@@ -508,7 +518,11 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
         "js" | "jsx" | "ts" | "tsx" => (
             Some(tree_sitter_javascript::LANGUAGE.into()),
             &["import_statement", "export_statement"],
-            &["function_declaration", "class_declaration", "method_definition"],
+            &[
+                "function_declaration",
+                "class_declaration",
+                "method_definition",
+            ],
             &[],
         ),
         _ => (None, &[], &[], &[]),
