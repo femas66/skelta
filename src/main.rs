@@ -248,11 +248,14 @@ async fn main() {
                     }
                 }
 
-                (path_str, AgentJsonFile {
-                    is_focused,
-                    signatures,
-                    dependencies,
-                })
+                (
+                    path_str,
+                    AgentJsonFile {
+                        is_focused,
+                        signatures,
+                        dependencies,
+                    },
+                )
             }));
         }
     }
@@ -275,7 +278,7 @@ async fn main() {
         let mut edges = Vec::new();
         let mut mermaid = String::from("\n## Local Dependency Graph\n```mermaid\ngraph TD\n");
         let mut name_to_path = HashMap::new();
-        
+
         for file_path in output_files.keys() {
             let file_name = Path::new(file_path)
                 .file_stem()
@@ -439,28 +442,52 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
     let mut dependencies = Vec::new();
     if path.ends_with(".rs") {
         let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_ok() {
+        if parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .is_ok()
+        {
             if let Some(tree) = parser.parse(content, None) {
                 let mut cursor = tree.walk();
-                extract_rust_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                extract_rust_sigs(
+                    content.as_bytes(),
+                    &mut cursor,
+                    &mut signatures,
+                    &mut dependencies,
+                );
                 return (signatures, dependencies);
             }
         }
     } else if path.ends_with(".py") {
         let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_ok() {
+        if parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .is_ok()
+        {
             if let Some(tree) = parser.parse(content, None) {
                 let mut cursor = tree.walk();
-                extract_python_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                extract_python_sigs(
+                    content.as_bytes(),
+                    &mut cursor,
+                    &mut signatures,
+                    &mut dependencies,
+                );
                 return (signatures, dependencies);
             }
         }
     } else if path.ends_with(".go") {
         let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&tree_sitter_go::LANGUAGE.into()).is_ok() {
+        if parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .is_ok()
+        {
             if let Some(tree) = parser.parse(content, None) {
                 let mut cursor = tree.walk();
-                extract_go_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                extract_go_sigs(
+                    content.as_bytes(),
+                    &mut cursor,
+                    &mut signatures,
+                    &mut dependencies,
+                );
                 return (signatures, dependencies);
             }
         }
@@ -470,15 +497,23 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
         || path.ends_with(".tsx")
     {
         let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&tree_sitter_javascript::LANGUAGE.into()).is_ok() {
+        if parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .is_ok()
+        {
             if let Some(tree) = parser.parse(content, None) {
                 let mut cursor = tree.walk();
-                extract_js_sigs(content.as_bytes(), &mut cursor, &mut signatures, &mut dependencies);
+                extract_js_sigs(
+                    content.as_bytes(),
+                    &mut cursor,
+                    &mut signatures,
+                    &mut dependencies,
+                );
                 return (signatures, dependencies);
             }
         }
     }
-    
+
     // Fallback regex
     for line in content.lines() {
         let trimmed = line.trim();
