@@ -1,15 +1,16 @@
 #![allow(clippy::collapsible_if)]
+use anyhow::{Context, Result};
 use clap::{
-    Parser, ValueEnum,
     builder::styling::{AnsiColor, Effects, Styles},
+    Parser, ValueEnum,
 };
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::fs;
 
@@ -85,8 +86,8 @@ struct CacheEntry {
 }
 
 #[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
+async fn main() -> Result<()> {
+    let cli = Cli::try_parse()?;
 
     let mut override_builder = OverrideBuilder::new(&cli.path);
     for exclude in &cli.exclude {
@@ -94,7 +95,8 @@ async fn main() {
     }
     let overrides = override_builder
         .build()
-        .unwrap_or_else(|_| OverrideBuilder::new(&cli.path).build().unwrap());
+        .or_else(|_| OverrideBuilder::new(&cli.path).build())
+        .context("Failed to build ignore overrides")?;
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
 
@@ -139,12 +141,13 @@ async fn main() {
     };
 
     let cache_file_path = cache_dir.join(".skelta_cache.json");
-    let cache_data: HashMap<String, CacheEntry> = std::fs::read_to_string(&cache_file_path)
+    let cache_data: HashMap<String, CacheEntry> = tokio::fs::read_to_string(&cache_file_path)
+        .await
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
         .unwrap_or_default();
-    let cache_arc = Arc::new(Mutex::new(cache_data));
 
+    let cache_arc = Arc::new(cache_data);
     let mut tasks = vec![];
     let mut output_tree = String::new();
 
@@ -173,13 +176,17 @@ async fn main() {
                 true
             };
 
-            let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+            let permit = Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .context("Failed to acquire semaphore permit")?;
             let cache_arc_clone = Arc::clone(&cache_arc);
 
             tasks.push(tokio::spawn(async move {
                 let _permit = permit;
                 let mut signatures = Vec::new();
                 let mut dependencies = Vec::new();
+                let mut new_cache_entry: Option<CacheEntry> = None;
 
                 if is_focused {
                     let metadata = fs::metadata(&path).await.ok();
@@ -194,30 +201,32 @@ async fn main() {
                     let mut cached_deps = None;
                     let mut cached_hash = String::new();
 
-                    {
-                        let cache_lock = cache_arc_clone.lock().unwrap();
-                        if let Some(entry) = cache_lock.get(&path_str) {
-                            cached_hash = entry.sha256_hash.clone();
-                            if entry.last_modified_timestamp == modified && modified > 0 {
-                                use_cache = true;
-                                cached_sigs = Some(entry.signatures.clone());
-                                cached_deps = Some(entry.dependencies.clone());
-                            }
+                    if let Some(entry) = cache_arc_clone.get(&path_str) {
+                        cached_hash = entry.sha256_hash.clone();
+                        if entry.last_modified_timestamp == modified && modified > 0 {
+                            use_cache = true;
+                            cached_sigs = Some(entry.signatures.clone());
+                            cached_deps = Some(entry.dependencies.clone());
                         }
                     }
 
                     let mut file_hash = String::new();
                     let (sigs, deps) = if use_cache {
-                        (cached_sigs.unwrap(), cached_deps.unwrap_or_default())
+                        (
+                            cached_sigs.unwrap_or_default(),
+                            cached_deps.unwrap_or_default(),
+                        )
                     } else if let Ok(content) = fs::read_to_string(&path).await {
                         let mut hasher = Sha256::new();
                         hasher.update(content.as_bytes());
                         file_hash = format!("{:x}", hasher.finalize());
 
                         if file_hash == cached_hash && !cached_hash.is_empty() {
-                            let cache_lock = cache_arc_clone.lock().unwrap();
-                            let entry = cache_lock.get(&path_str).unwrap();
-                            (entry.signatures.clone(), entry.dependencies.clone())
+                            if let Some(entry) = cache_arc_clone.get(&path_str) {
+                                (entry.signatures.clone(), entry.dependencies.clone())
+                            } else {
+                                (Vec::new(), Vec::new())
+                            }
                         } else {
                             let path_clone = path_str.clone();
                             tokio::task::spawn_blocking(move || process_file(&path_clone, &content))
@@ -227,52 +236,54 @@ async fn main() {
                     } else {
                         (Vec::new(), Vec::new())
                     };
-                    signatures = sigs;
-                    dependencies = deps;
+
+                    signatures = sigs.clone();
+                    dependencies = deps.clone();
 
                     if !file_hash.is_empty() {
-                        let mut cache_lock = cache_arc_clone.lock().unwrap();
-                        cache_lock.insert(
-                            path_str.clone(),
-                            CacheEntry {
-                                sha256_hash: file_hash,
-                                last_modified_timestamp: modified,
-                                signatures: signatures.clone(),
-                                dependencies: dependencies.clone(),
-                            },
-                        );
+                        new_cache_entry = Some(CacheEntry {
+                            sha256_hash: file_hash,
+                            last_modified_timestamp: modified,
+                            signatures: signatures.clone(),
+                            dependencies: dependencies.clone(),
+                        });
                     } else if use_cache {
-                        let mut cache_lock = cache_arc_clone.lock().unwrap();
-                        if let Some(entry) = cache_lock.get_mut(&path_str) {
-                            entry.last_modified_timestamp = modified;
+                        if let Some(entry) = cache_arc_clone.get(&path_str) {
+                            let mut updated_entry = entry.clone();
+                            updated_entry.last_modified_timestamp = modified;
+                            new_cache_entry = Some(updated_entry);
                         }
                     }
                 }
 
-                (
-                    path_str,
-                    AgentJsonFile {
-                        is_focused,
-                        signatures,
-                        dependencies,
-                    },
-                )
+                let file_data = AgentJsonFile {
+                    is_focused,
+                    signatures,
+                    dependencies,
+                };
+
+                (path_str, file_data, new_cache_entry)
             }));
         }
     }
 
     let mut output_files = BTreeMap::new();
+    let mut updated_cache = Arc::try_unwrap(cache_arc).unwrap_or_else(|arc| (*arc).clone());
+
     let results = futures_util::future::join_all(tasks).await;
-    for (path_str, file_data) in results.into_iter().flatten() {
-        output_files.insert(path_str, file_data);
+    for res in results {
+        if let Ok((path_str, file_data, cache_entry_opt)) = res {
+            output_files.insert(path_str.clone(), file_data);
+            if let Some(entry) = cache_entry_opt {
+                updated_cache.insert(path_str, entry);
+            }
+        }
     }
 
-    if let Ok(cache_lock) = cache_arc.lock() {
-        let _ =
-            serde_json::to_string(&*cache_lock).map(|json| std::fs::write(&cache_file_path, json));
+    if let Ok(json) = serde_json::to_string(&updated_cache) {
+        let _ = tokio::fs::write(&cache_file_path, json).await;
     }
 
-    // Build local dependency graph O(N)
     let (local_graph, graph_mermaid) = {
         let mut edges = Vec::new();
         let mut mermaid = String::from("\n## Local Dependency Graph\n```mermaid\ngraph TD\n");
@@ -293,7 +304,7 @@ async fn main() {
                 .unwrap_or(file_path);
             for dep in &file_data.dependencies {
                 for (target_name, target_path) in &name_to_path {
-                    if dep.contains(target_name) && file_path != target_path {
+                    if file_path != target_path && contains_word_boundary(dep, target_name) {
                         edges.push((file_path.clone(), target_path.clone()));
                         let safe_src = file_name.replace(['-', '.'], "_");
                         let safe_tgt = target_name.replace(['-', '.'], "_");
@@ -315,7 +326,7 @@ async fn main() {
             if let Some(parent) = std::path::Path::new(p).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            Box::new(std::fs::File::create(p).expect("Failed to create output file"))
+            Box::new(std::fs::File::create(p).context("Failed to create output file")?)
         }
         None => Box::new(io::stdout()),
     };
@@ -383,9 +394,9 @@ async fn main() {
                 md.push_str(&format!("- [Out of focus] {}\n", path));
             }
         }
-        write!(out, "{}", md).unwrap();
+        write!(out, "{}", md).context("Failed to write to output")?;
     } else if cli.format == Format::TreeOnly {
-        write!(out, "{}", output_tree).unwrap();
+        write!(out, "{}", output_tree).context("Failed to write tree output")?;
     } else if cli.format == Format::AgentJson {
         let total_files = output_files.len();
         let total_focused = output_files.values().filter(|f| f.is_focused).count();
@@ -400,9 +411,31 @@ async fn main() {
             files: &output_files,
             local_dependency_graph: local_graph,
         };
-        let json_str = serde_json::to_string_pretty(&wrapper).unwrap();
-        writeln!(out, "{}", json_str).unwrap();
+        let json_str =
+            serde_json::to_string_pretty(&wrapper).context("Failed to serialize output json")?;
+        writeln!(out, "{}", json_str).context("Failed to write json output")?;
     }
+
+    Ok(())
+}
+
+fn contains_word_boundary(text: &str, word: &str) -> bool {
+    if text.is_empty() || word.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(idx) = text[start..].find(word) {
+        let abs_idx = start + idx;
+        let before_is_boundary = abs_idx == 0 || !text[..abs_idx].chars().last().unwrap_or(' ').is_alphanumeric();
+        let after_idx = abs_idx + word.len();
+        let after_is_boundary = after_idx == text.len() || !text[after_idx..].chars().next().unwrap_or(' ').is_alphanumeric();
+
+        if before_is_boundary && after_is_boundary {
+            return true;
+        }
+        start = abs_idx + word.len();
+    }
+    false
 }
 
 fn is_code_file(path: &Path) -> bool {
@@ -439,72 +472,58 @@ fn is_code_file(path: &Path) -> bool {
 fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
     let mut signatures = Vec::new();
     let mut dependencies = Vec::new();
-    if path.ends_with(".rs") {
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .is_ok()
-        {
+
+    let path_obj = Path::new(path);
+    let ext = path_obj
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let mut parser = tree_sitter::Parser::new();
+    let (lang, dep_types, sig_types_body, sig_types_no_body): (
+        Option<tree_sitter::Language>,
+        &[&str],
+        &[&str],
+        &[&str],
+    ) = match ext.as_str() {
+        "rs" => (
+            Some(tree_sitter_rust::LANGUAGE.into()),
+            &["use_declaration"],
+            &["function_item", "struct_item", "impl_item", "trait_item"],
+            &[],
+        ),
+        "py" => (
+            Some(tree_sitter_python::LANGUAGE.into()),
+            &["import_statement", "import_from_statement"],
+            &["function_definition", "class_definition"],
+            &[],
+        ),
+        "go" => (
+            Some(tree_sitter_go::LANGUAGE.into()),
+            &["import_declaration"],
+            &["function_declaration", "method_declaration"],
+            &["type_declaration"],
+        ),
+        "js" | "jsx" | "ts" | "tsx" => (
+            Some(tree_sitter_javascript::LANGUAGE.into()),
+            &["import_statement", "export_statement"],
+            &["function_declaration", "class_declaration", "method_definition"],
+            &[],
+        ),
+        _ => (None, &[], &[], &[]),
+    };
+
+    if let Some(language) = lang {
+        if parser.set_language(&language).is_ok() {
             if let Some(tree) = parser.parse(content, None) {
                 let mut cursor = tree.walk();
-                extract_rust_sigs(
+                extract_ast_nodes(
                     content.as_bytes(),
                     &mut cursor,
-                    &mut signatures,
-                    &mut dependencies,
-                );
-                return (signatures, dependencies);
-            }
-        }
-    } else if path.ends_with(".py") {
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .is_ok()
-        {
-            if let Some(tree) = parser.parse(content, None) {
-                let mut cursor = tree.walk();
-                extract_python_sigs(
-                    content.as_bytes(),
-                    &mut cursor,
-                    &mut signatures,
-                    &mut dependencies,
-                );
-                return (signatures, dependencies);
-            }
-        }
-    } else if path.ends_with(".go") {
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_go::LANGUAGE.into())
-            .is_ok()
-        {
-            if let Some(tree) = parser.parse(content, None) {
-                let mut cursor = tree.walk();
-                extract_go_sigs(
-                    content.as_bytes(),
-                    &mut cursor,
-                    &mut signatures,
-                    &mut dependencies,
-                );
-                return (signatures, dependencies);
-            }
-        }
-    } else if path.ends_with(".js")
-        || path.ends_with(".jsx")
-        || path.ends_with(".ts")
-        || path.ends_with(".tsx")
-    {
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_javascript::LANGUAGE.into())
-            .is_ok()
-        {
-            if let Some(tree) = parser.parse(content, None) {
-                let mut cursor = tree.walk();
-                extract_js_sigs(
-                    content.as_bytes(),
-                    &mut cursor,
+                    dep_types,
+                    sig_types_body,
+                    sig_types_no_body,
                     &mut signatures,
                     &mut dependencies,
                 );
@@ -557,64 +576,40 @@ fn process_file(path: &str, content: &str) -> (Vec<String>, Vec<String>) {
         ]
         .iter()
         .any(|&k| cleaned.starts_with(k));
-        if is_structural && trimmed.contains("{") {
-            let sig = trimmed.split('{').next().unwrap().trim().to_string();
-            signatures.push(sig);
+
+        if is_structural {
+            if let Some(brace_idx) = trimmed.find('{') {
+                let sig = trimmed[..brace_idx].trim().to_string();
+                if !sig.is_empty() {
+                    signatures.push(sig);
+                }
+            } else {
+                if !trimmed.is_empty() {
+                    signatures.push(trimmed.to_string());
+                }
+            }
         }
     }
     (signatures, dependencies)
 }
 
-fn extract_rust_sigs(
+fn extract_ast_nodes(
     content: &[u8],
     cursor: &mut tree_sitter::TreeCursor,
+    dep_types: &[&str],
+    sig_types_body: &[&str],
+    sig_types_no_body: &[&str],
     signatures: &mut Vec<String>,
     dependencies: &mut Vec<String>,
 ) {
     loop {
         let node = cursor.node();
         let kind = node.kind();
-        if kind == "use_declaration" {
+        if dep_types.contains(&kind) {
             if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
                 dependencies.push(dep.trim().to_string());
             }
-        } else if kind == "function_item"
-            || kind == "struct_item"
-            || kind == "impl_item"
-            || kind == "trait_item"
-        {
-            let mut sig_end = node.end_byte();
-            if let Some(block) = node.child_by_field_name("body") {
-                sig_end = block.start_byte();
-            }
-            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
-                signatures.push(sig.trim().to_string());
-            }
-        }
-        if cursor.goto_first_child() {
-            extract_rust_sigs(content, cursor, signatures, dependencies);
-            cursor.goto_parent();
-        }
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn extract_python_sigs(
-    content: &[u8],
-    cursor: &mut tree_sitter::TreeCursor,
-    signatures: &mut Vec<String>,
-    dependencies: &mut Vec<String>,
-) {
-    loop {
-        let node = cursor.node();
-        let kind = node.kind();
-        if kind == "import_statement" || kind == "import_from_statement" {
-            if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
-                dependencies.push(dep.trim().to_string());
-            }
-        } else if kind == "function_definition" || kind == "class_definition" {
+        } else if sig_types_body.contains(&kind) {
             let mut sig_end = node.end_byte();
             if let Some(body) = node.child_by_field_name("body") {
                 sig_end = body.start_byte();
@@ -622,81 +617,21 @@ fn extract_python_sigs(
             if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
                 signatures.push(sig.trim().to_string());
             }
-        }
-        if cursor.goto_first_child() {
-            extract_python_sigs(content, cursor, signatures, dependencies);
-            cursor.goto_parent();
-        }
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn extract_go_sigs(
-    content: &[u8],
-    cursor: &mut tree_sitter::TreeCursor,
-    signatures: &mut Vec<String>,
-    dependencies: &mut Vec<String>,
-) {
-    loop {
-        let node = cursor.node();
-        let kind = node.kind();
-        if kind == "import_declaration" {
-            if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
-                dependencies.push(dep.trim().to_string());
-            }
-        } else if kind == "function_declaration" || kind == "method_declaration" {
-            let mut sig_end = node.end_byte();
-            if let Some(body) = node.child_by_field_name("body") {
-                sig_end = body.start_byte();
-            }
-            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
-                signatures.push(sig.trim().to_string());
-            }
-        } else if kind == "type_declaration" {
-            let bytes = &content[node.start_byte()..node.end_byte()];
-            if let Ok(sig) = std::str::from_utf8(bytes) {
+        } else if sig_types_no_body.contains(&kind) {
+            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
                 signatures.push(sig.trim().to_string());
             }
         }
         if cursor.goto_first_child() {
-            extract_go_sigs(content, cursor, signatures, dependencies);
-            cursor.goto_parent();
-        }
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-}
-
-fn extract_js_sigs(
-    content: &[u8],
-    cursor: &mut tree_sitter::TreeCursor,
-    signatures: &mut Vec<String>,
-    dependencies: &mut Vec<String>,
-) {
-    loop {
-        let node = cursor.node();
-        let kind = node.kind();
-        if kind == "import_statement" || kind == "export_statement" {
-            if let Ok(dep) = std::str::from_utf8(&content[node.start_byte()..node.end_byte()]) {
-                dependencies.push(dep.trim().to_string());
-            }
-        } else if kind == "function_declaration"
-            || kind == "class_declaration"
-            || kind == "method_definition"
-        {
-            let mut sig_end = node.end_byte();
-            if let Some(body) = node.child_by_field_name("body") {
-                sig_end = body.start_byte();
-            }
-            if let Ok(sig) = std::str::from_utf8(&content[node.start_byte()..sig_end]) {
-                signatures.push(sig.trim().to_string());
-            }
-        }
-        if cursor.goto_first_child() {
-            extract_js_sigs(content, cursor, signatures, dependencies);
+            extract_ast_nodes(
+                content,
+                cursor,
+                dep_types,
+                sig_types_body,
+                sig_types_no_body,
+                signatures,
+                dependencies,
+            );
             cursor.goto_parent();
         }
         if !cursor.goto_next_sibling() {
