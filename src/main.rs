@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 use clap::{
     Parser, ValueEnum,
     builder::styling::{AnsiColor, Effects, Styles},
@@ -262,10 +263,8 @@ async fn main() {
 
     let mut output_files = BTreeMap::new();
     let results = futures_util::future::join_all(tasks).await;
-    for res in results {
-        if let Ok((path_str, file_data)) = res {
-            output_files.insert(path_str, file_data);
-        }
+    for (path_str, file_data) in results.into_iter().flatten() {
+        output_files.insert(path_str, file_data);
     }
 
     if let Ok(cache_lock) = cache_arc.lock() {
